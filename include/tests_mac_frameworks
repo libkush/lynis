@@ -21,6 +21,7 @@
     MAC_FRAMEWORK_ACTIVE=0              # Default no MAC framework active
     RBAC_FRAMEWORK_ACTIVE=0             # Default no RBAC framework active
     SELINUXFOUND=0
+    SELINUX_MODE=""
     TOMOYOFOUND=0
 
     InsertSection "${SECTION_SECURITY_FRAMEWORKS}"
@@ -144,6 +145,7 @@
             SELINUXFOUND=1
             Display --indent 4 --text "- Checking SELinux status" --result "${STATUS_ENABLED}" --color GREEN
             FIND=$(${SESTATUSBINARY} | ${GREPBINARY} "^Current mode" | ${AWKBINARY} '{ print $3 }')
+            SELINUX_MODE="${FIND}"
             Report "selinux_mode=${FIND}"
             FIND2=$(${SESTATUSBINARY} | ${GREPBINARY} "^Mode from config file" | ${AWKBINARY} '{ print $5 }')
             LogText "Result: current SELinux mode is ${FIND}"
@@ -175,6 +177,277 @@
         else
             LogText "Result: SELinux framework is disabled"
             Display --indent 4 --text "- Checking SELinux status" --result "${STATUS_DISABLED}" --color YELLOW
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MACF-6236
+    # Description : Check SELinux confinement of non-loopback TCP/UDP listeners
+    PREQS_MET="NO"; SKIPREASON="SELinux is not enabled or ss binary not found"
+    if [ ${SELINUXFOUND} -eq 1 -a -n "${SSBINARY}" ]; then PREQS_MET="YES"; SKIPREASON=""; fi
+    Register --test-no MACF-6236 --os Linux --preqs-met ${PREQS_MET} --skip-reason "${SKIPREASON}" --weight L --network NO --root-only YES --category security --description "Check SELinux confinement of TCP/UDP listeners"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        SELINUX_LISTENER_COUNT=0
+        SELINUX_LISTENER_CONFINED_COUNT=0
+        SELINUX_LISTENER_UNPROTECTED_COUNT=0
+        SELINUX_LISTENER_UNKNOWN_COUNT=0
+        SELINUX_LISTENER_DETAIL_COUNT=0
+        SELINUX_LISTENER_DETAIL_TRUNCATED=0
+        SELINUX_LISTENER_CONFINEMENT_PERCENTAGE=-1
+        SELINUX_PERMISSIVE_DOMAINS=""
+
+        if [ -n "${SEMANAGEBINARY}" ]; then
+            SELINUX_PERMISSIVE_DOMAINS=$(${SEMANAGEBINARY} permissive --list --noheading 2> /dev/null | ${AWKBINARY} '{ print $1 }')
+            LogText "Permissive SELinux domains used for listener check: ${SELINUX_PERMISSIVE_DOMAINS}"
+        else
+            LogText "Result: semanage binary not found, explicitly permissive domains can not be correlated with listeners"
+        fi
+
+        CreateTempFile || ExitFatal
+        SELINUX_LISTENER_RAW_FILE="${TEMP_FILE}"
+        CreateTempFile || ExitFatal
+        SELINUX_LISTENER_FILE="${TEMP_FILE}"
+        CreateTempFile || ExitFatal
+        SELINUX_LISTENER_ERROR_FILE="${TEMP_FILE}"
+
+        LogText "Test: retrieving TCP/UDP listeners and process SELinux contexts with ss"
+        ${SSBINARY} --query=udp,tcp -HOnlpZ > ${SELINUX_LISTENER_RAW_FILE} 2> ${SELINUX_LISTENER_ERROR_FILE}
+        SELINUX_LISTENER_RESULT=$?
+        if [ ${SELINUX_LISTENER_RESULT} -eq 0 ]; then
+            ${AWKBINARY} '
+                $1 == "tcp" || $1 == "udp" {
+                    protocol=$1
+                    address=$5
+                    process="-"
+                    pid="-"
+                    context="-"
+                    data=$0
+                    entry=data
+                    sub(/^.*users:\(\("/, "", entry)
+                    if (entry != data) {
+                        sub(/\),\(".*$/, "", entry)
+                        process=entry
+                        sub(/".*$/, "", process)
+                        value=entry
+                        sub(/^.*pid=/, "", value)
+                        pid=value
+                        sub(/[^0-9].*$/, "", pid)
+                        value=entry
+                        sub(/^.*proc_ctx=/, "", value)
+                        if (value != entry) {
+                            context=value
+                            sub(/,fd=.*$/, "", context)
+                        }
+                    }
+                    print protocol "|" address "|" process "|" pid "|" context
+                }
+            ' ${SELINUX_LISTENER_RAW_FILE} > ${SELINUX_LISTENER_FILE}
+
+            while IFS='|' read LISTENER_PROTOCOL LISTENER_ADDRESS LISTENER_PROCESS LISTENER_PID LISTENER_CONTEXT; do
+                case ${LISTENER_ADDRESS} in
+                    127.*:*|\[::1\]:*|::1:*)
+                        LogText "Result: ignoring loopback listener ${LISTENER_PROTOCOL}|${LISTENER_ADDRESS}|${LISTENER_PROCESS}"
+                        continue
+                    ;;
+                esac
+
+                SELINUX_LISTENER_COUNT=$((SELINUX_LISTENER_COUNT + 1))
+                LISTENER_DOMAIN=""
+                LISTENER_REASON=""
+                case ${LISTENER_CONTEXT} in
+                    *:*:*) LISTENER_DOMAIN=$(echo "${LISTENER_CONTEXT}" | ${AWKBINARY} -F: '{ print $3 }') ;;
+                esac
+
+                if [ -z "${LISTENER_DOMAIN}" ]; then
+                    SELINUX_LISTENER_UNKNOWN_COUNT=$((SELINUX_LISTENER_UNKNOWN_COUNT + 1))
+                    LogText "Result: no SELinux process context found for listener ${LISTENER_PROTOCOL}|${LISTENER_ADDRESS}|${LISTENER_PROCESS}|${LISTENER_PID}"
+                    continue
+                fi
+
+                if [ ! "${SELINUX_MODE}" = "enforcing" ]; then
+                    LISTENER_REASON="global-permissive"
+                else
+                    case ${LISTENER_DOMAIN} in
+                        unconfined_t|unconfined_service_t) LISTENER_REASON="unconfined-domain" ;;
+                        initrc_t)                          LISTENER_REASON="weak-domain" ;;
+                    esac
+                    if [ -z "${LISTENER_REASON}" ]; then
+                        for PERMISSIVE_DOMAIN in ${SELINUX_PERMISSIVE_DOMAINS}; do
+                            if [ "${LISTENER_DOMAIN}" = "${PERMISSIVE_DOMAIN}" ]; then
+                                LISTENER_REASON="permissive-domain"
+                            fi
+                        done
+                    fi
+                fi
+
+                if [ -n "${LISTENER_REASON}" ]; then
+                    SELINUX_LISTENER_UNPROTECTED_COUNT=$((SELINUX_LISTENER_UNPROTECTED_COUNT + 1))
+                    LogText "Result: unprotected SELinux network listener: ${LISTENER_PROTOCOL}|${LISTENER_ADDRESS}|${LISTENER_PROCESS}|${LISTENER_PID}|${LISTENER_DOMAIN}|${LISTENER_REASON}"
+                    if [ ${SELINUX_LISTENER_DETAIL_COUNT} -lt 20 ]; then
+                        Report "selinux_unprotected_network_listener[]=${LISTENER_PROTOCOL}|${LISTENER_ADDRESS}|${LISTENER_PROCESS}|${LISTENER_PID}|${LISTENER_DOMAIN}|${LISTENER_REASON}"
+                        SELINUX_LISTENER_DETAIL_COUNT=$((SELINUX_LISTENER_DETAIL_COUNT + 1))
+                    else
+                        SELINUX_LISTENER_DETAIL_TRUNCATED=1
+                    fi
+                else
+                    SELINUX_LISTENER_CONFINED_COUNT=$((SELINUX_LISTENER_CONFINED_COUNT + 1))
+                    LogText "Result: confined SELinux network listener: ${LISTENER_PROTOCOL}|${LISTENER_ADDRESS}|${LISTENER_PROCESS}|${LISTENER_PID}|${LISTENER_DOMAIN}"
+                fi
+            done < ${SELINUX_LISTENER_FILE}
+
+            SELINUX_LISTENER_ATTRIBUTABLE_COUNT=$((SELINUX_LISTENER_CONFINED_COUNT + SELINUX_LISTENER_UNPROTECTED_COUNT))
+            if [ ${SELINUX_LISTENER_ATTRIBUTABLE_COUNT} -gt 0 ]; then
+                SELINUX_LISTENER_CONFINEMENT_PERCENTAGE=$((SELINUX_LISTENER_CONFINED_COUNT * 100 / SELINUX_LISTENER_ATTRIBUTABLE_COUNT))
+            fi
+
+            Report "selinux_network_listener_count=${SELINUX_LISTENER_COUNT}"
+            Report "selinux_network_listener_confined_count=${SELINUX_LISTENER_CONFINED_COUNT}"
+            Report "selinux_network_listener_unprotected_count=${SELINUX_LISTENER_UNPROTECTED_COUNT}"
+            Report "selinux_network_listener_unknown_count=${SELINUX_LISTENER_UNKNOWN_COUNT}"
+            Report "selinux_network_listener_confinement_percentage=${SELINUX_LISTENER_CONFINEMENT_PERCENTAGE}"
+            Report "selinux_network_listener_detail_truncated=${SELINUX_LISTENER_DETAIL_TRUNCATED}"
+
+            Display --indent 8 --text "Found ${SELINUX_LISTENER_COUNT} non-loopback TCP/UDP listeners"
+            if [ ${SELINUX_LISTENER_UNPROTECTED_COUNT} -gt 0 ]; then
+                Display --indent 4 --text "- Checking SELinux network listener confinement" --result "${STATUS_SUGGESTION}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "Review network services running in unconfined or permissive SELinux domains" "${SELINUX_LISTENER_UNPROTECTED_COUNT} listener(s)" "-"
+            elif [ ${SELINUX_LISTENER_UNKNOWN_COUNT} -gt 0 ]; then
+                Display --indent 4 --text "- Checking SELinux network listener confinement" --result "${STATUS_UNKNOWN}" --color YELLOW
+            else
+                Display --indent 4 --text "- Checking SELinux network listener confinement" --result "${STATUS_OK}" --color GREEN
+            fi
+        else
+            SELINUX_LISTENER_ERROR=$(${CAT_BINARY} ${SELINUX_LISTENER_ERROR_FILE} | ${TRBINARY} '\n' ' ')
+            LogText "Result: ss could not return SELinux listener contexts (exit code ${SELINUX_LISTENER_RESULT}): ${SELINUX_LISTENER_ERROR}"
+            Display --indent 4 --text "- Checking SELinux network listener confinement" --result "${STATUS_UNKNOWN}" --color YELLOW
+            ReportException "${TEST_NO}:01" "Could not retrieve SELinux process contexts for TCP/UDP listeners"
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MACF-6238
+    # Description : Check TCP/UDP SELinux AVC events since boot
+    PREQS_MET="NO"; SKIPREASON="SELinux is not enabled or ausearch binary not found"
+    if [ ${SELINUXFOUND} -eq 1 -a -n "${AUSEARCHBINARY}" ]; then PREQS_MET="YES"; SKIPREASON=""; fi
+    Register --test-no MACF-6238 --os Linux --preqs-met ${PREQS_MET} --skip-reason "${SKIPREASON}" --weight L --network NO --root-only YES --category security --description "Check TCP/UDP SELinux AVC events since boot"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        SELINUX_NETWORK_AVC_COUNT=0
+        SELINUX_NETWORK_AVC_BLOCKED_COUNT=0
+        SELINUX_NETWORK_AVC_PERMISSIVE_COUNT=0
+        SELINUX_NETWORK_AVC_UNKNOWN_MODE_COUNT=0
+        SELINUX_NETWORK_AVC_DOMAIN_COUNT=0
+        SELINUX_NETWORK_AVC_DOMAINS=""
+        SELINUX_NETWORK_AVC_DETAIL_COUNT=0
+        SELINUX_NETWORK_AVC_DETAIL_TRUNCATED=0
+
+        CreateTempFile || ExitFatal
+        SELINUX_NETWORK_AVC_RAW_FILE="${TEMP_FILE}"
+        CreateTempFile || ExitFatal
+        SELINUX_NETWORK_AVC_FILE="${TEMP_FILE}"
+        CreateTempFile || ExitFatal
+        SELINUX_NETWORK_AVC_ERROR_FILE="${TEMP_FILE}"
+
+        LogText "Test: querying TCP/UDP SELinux AVC events recorded since boot"
+        ${AUSEARCHBINARY} --input-logs --start boot --message AVC,USER_AVC --raw > ${SELINUX_NETWORK_AVC_RAW_FILE} 2> ${SELINUX_NETWORK_AVC_ERROR_FILE}
+        SELINUX_NETWORK_AVC_RESULT=$?
+        SELINUX_NETWORK_AVC_NO_MATCHES=0
+        if [ ${SELINUX_NETWORK_AVC_RESULT} -eq 1 ]; then
+            FIND=$(${GREPBINARY} '^<no matches>$' ${SELINUX_NETWORK_AVC_RAW_FILE})
+            if [ -n "${FIND}" ]; then
+                SELINUX_NETWORK_AVC_NO_MATCHES=1
+            elif [ ! -s ${SELINUX_NETWORK_AVC_RAW_FILE} -a ! -s ${SELINUX_NETWORK_AVC_ERROR_FILE} ]; then
+                SELINUX_NETWORK_AVC_NO_MATCHES=1
+            fi
+        fi
+
+        if [ ${SELINUX_NETWORK_AVC_RESULT} -eq 0 -o ${SELINUX_NETWORK_AVC_NO_MATCHES} -eq 1 ]; then
+            ${AWKBINARY} '
+                function get_value(data, name, value) {
+                    value=data
+                    sub("^.*" name "=", "", value)
+                    if (value == data) return "-"
+                    if (substr(value, 1, 1) == "\"") {
+                        sub(/^"/, "", value)
+                        sub(/".*$/, "", value)
+                    } else {
+                        sub(/[[:space:]].*$/, "", value)
+                    }
+                    return value
+                }
+                /type=(AVC|USER_AVC)/ && /tclass=(tcp_socket|udp_socket)/ {
+                    event=$0
+                    sub(/^.*msg=audit\(/, "", event)
+                    sub(/\):.*$/, "", event)
+                    if (seen[event]++) next
+                    class=get_value($0, "tclass")
+                    protocol=class
+                    sub(/_socket$/, "", protocol)
+                    context=get_value($0, "scontext")
+                    domain=context
+                    sub(/^[^:]*:[^:]*:/, "", domain)
+                    sub(/:.*/, "", domain)
+                    if (context == "-") domain="-"
+                    permission=$0
+                    sub(/^.*avc:[[:space:]]*denied[[:space:]]*\{[[:space:]]*/, "", permission)
+                    sub(/[[:space:]]*\}.*$/, "", permission)
+                    gsub(/[[:space:]]+/, ",", permission)
+                    destination=get_value($0, "dest")
+                    process=get_value($0, "comm")
+                    permissive=get_value($0, "permissive")
+                    print protocol "|" domain "|" permission "|" destination "|" permissive "|" process
+                }
+            ' ${SELINUX_NETWORK_AVC_RAW_FILE} > ${SELINUX_NETWORK_AVC_FILE}
+
+            while IFS='|' read AVC_PROTOCOL AVC_DOMAIN AVC_PERMISSION AVC_DESTINATION AVC_PERMISSIVE AVC_PROCESS; do
+                SELINUX_NETWORK_AVC_COUNT=$((SELINUX_NETWORK_AVC_COUNT + 1))
+                case ${AVC_PERMISSIVE} in
+                    0) SELINUX_NETWORK_AVC_BLOCKED_COUNT=$((SELINUX_NETWORK_AVC_BLOCKED_COUNT + 1)); AVC_MODE="blocked" ;;
+                    1) SELINUX_NETWORK_AVC_PERMISSIVE_COUNT=$((SELINUX_NETWORK_AVC_PERMISSIVE_COUNT + 1)); AVC_MODE="permissive" ;;
+                    *) SELINUX_NETWORK_AVC_UNKNOWN_MODE_COUNT=$((SELINUX_NETWORK_AVC_UNKNOWN_MODE_COUNT + 1)); AVC_MODE="unknown" ;;
+                esac
+
+                case " ${SELINUX_NETWORK_AVC_DOMAINS} " in
+                    *" ${AVC_DOMAIN} "*) ;;
+                    *)
+                        SELINUX_NETWORK_AVC_DOMAINS="${SELINUX_NETWORK_AVC_DOMAINS} ${AVC_DOMAIN}"
+                        SELINUX_NETWORK_AVC_DOMAIN_COUNT=$((SELINUX_NETWORK_AVC_DOMAIN_COUNT + 1))
+                    ;;
+                esac
+
+                LogText "Result: TCP/UDP SELinux AVC event: ${AVC_PROTOCOL}|${AVC_DOMAIN}|${AVC_PERMISSION}|${AVC_DESTINATION}|${AVC_MODE}|${AVC_PROCESS}"
+                if [ ${SELINUX_NETWORK_AVC_DETAIL_COUNT} -lt 20 ]; then
+                    Report "selinux_network_avc[]=${AVC_PROTOCOL}|${AVC_DOMAIN}|${AVC_PERMISSION}|${AVC_DESTINATION}|${AVC_MODE}|${AVC_PROCESS}"
+                    SELINUX_NETWORK_AVC_DETAIL_COUNT=$((SELINUX_NETWORK_AVC_DETAIL_COUNT + 1))
+                else
+                    SELINUX_NETWORK_AVC_DETAIL_TRUNCATED=1
+                fi
+            done < ${SELINUX_NETWORK_AVC_FILE}
+
+            Report "selinux_network_avc_period=boot"
+            Report "selinux_network_avc_count=${SELINUX_NETWORK_AVC_COUNT}"
+            Report "selinux_network_avc_blocked_count=${SELINUX_NETWORK_AVC_BLOCKED_COUNT}"
+            Report "selinux_network_avc_permissive_count=${SELINUX_NETWORK_AVC_PERMISSIVE_COUNT}"
+            Report "selinux_network_avc_unknown_mode_count=${SELINUX_NETWORK_AVC_UNKNOWN_MODE_COUNT}"
+            Report "selinux_network_avc_domain_count=${SELINUX_NETWORK_AVC_DOMAIN_COUNT}"
+            Report "selinux_network_avc_detail_truncated=${SELINUX_NETWORK_AVC_DETAIL_TRUNCATED}"
+
+            Display --indent 8 --text "Found ${SELINUX_NETWORK_AVC_COUNT} TCP/UDP SELinux AVC events since boot"
+            if [ ${SELINUX_NETWORK_AVC_PERMISSIVE_COUNT} -gt 0 ]; then
+                Display --indent 4 --text "- Checking TCP/UDP SELinux AVC events" --result "${STATUS_WARNING}" --color RED
+                ReportWarning "${TEST_NO}" "Review network-related SELinux denials that occurred in permissive mode" "${SELINUX_NETWORK_AVC_PERMISSIVE_COUNT} event(s)" "-"
+            elif [ ${SELINUX_NETWORK_AVC_BLOCKED_COUNT} -gt 0 -o ${SELINUX_NETWORK_AVC_UNKNOWN_MODE_COUNT} -gt 0 ]; then
+                Display --indent 4 --text "- Checking TCP/UDP SELinux AVC events" --result "${STATUS_SUGGESTION}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "Review network-related SELinux denials" "${SELINUX_NETWORK_AVC_COUNT} event(s) since boot" "-"
+            else
+                Display --indent 4 --text "- Checking TCP/UDP SELinux AVC events" --result "${STATUS_OK}" --color GREEN
+            fi
+        else
+            SELINUX_NETWORK_AVC_ERROR=$(${CAT_BINARY} ${SELINUX_NETWORK_AVC_ERROR_FILE} | ${TRBINARY} '\n' ' ')
+            LogText "Result: ausearch could not query SELinux AVC events (exit code ${SELINUX_NETWORK_AVC_RESULT}): ${SELINUX_NETWORK_AVC_ERROR}"
+            Display --indent 4 --text "- Checking TCP/UDP SELinux AVC events" --result "${STATUS_UNKNOWN}" --color YELLOW
+            ReportException "${TEST_NO}:01" "Could not query SELinux AVC events from the audit log"
         fi
     fi
 #

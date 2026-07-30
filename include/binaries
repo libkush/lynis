@@ -135,6 +135,7 @@
                             apt)                    APTBINARY=${BINARY};               LogText "  Found known binary: apt (package manager) - ${BINARY}" ;;
                             apk)                    APKBINARY=${BINARY};               LogText "  Found known binary: apk (package manager) - ${BINARY}" ;;
                             arch-audit)             ARCH_AUDIT_BINARY="${BINARY}";     LogText "  Found known binary: arch-audit (auditing utility to test for vulnerable packages) - ${BINARY}" ;;
+                            ausearch)               AUSEARCHBINARY="${BINARY}";        LogText "  Found known binary: ausearch (audit log search utility) - ${BINARY}" ;;
                             auditd)                 AUDITDBINARY=${BINARY};            LogText "  Found known binary: auditd (audit framework) - ${BINARY}" ;;
                             awk)                    AWKBINARY=${BINARY};               LogText "  Found known binary: awk (string tool) - ${BINARY}" ;;
                             as)                     ASBINARY="${BINARY}";              COMPILER_INSTALLED=1;                  LogText "  Found known binary: as (compiler) - ${BINARY}" ;;

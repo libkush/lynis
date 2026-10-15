@@ -377,6 +377,9 @@
                     return value
                 }
                 /type=(AVC|USER_AVC)/ && /tclass=(tcp_socket|udp_socket)/ {
+                    # ausearch --raw terminates each record with ASCII 0x1D (GS);
+                    # strip it so the trailing permissive field matches the shell case.
+                    gsub(/\035/, "", $0)
                     event=$0
                     sub(/^.*msg=audit\(/, "", event)
                     sub(/\):.*$/, "", event)
